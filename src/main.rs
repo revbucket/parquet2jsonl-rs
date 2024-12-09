@@ -1,4 +1,5 @@
 
+use serde_json::{Value, Map};
 use indicatif::{ProgressBar, ProgressStyle};
 use clap::{Parser};
 use anyhow::{Result, Error};
@@ -78,9 +79,20 @@ fn build_pbar(num_items: usize, units: &str) -> ProgressBar {
 
 fn process_parquet(parquet: &PathBuf, counter: &AtomicUsize, text_key: String, id_key: String, max_docs: usize, output_dir: &PathBuf, prefix: &str) -> Result<(), Error> {
 
-    let cols: Vec<String> = vec![text_key, id_key];
-    let json_rows = parquet_to_json(parquet, Some(cols)).unwrap();
+    let cols: Vec<String> = vec![text_key, id_key.clone()];
+    let mut json_rows = parquet_to_json(parquet, Some(cols)).unwrap();
 
+    if id_key.clone() != "id" {
+        for obj in json_rows.iter_mut() {
+            if let Value::Object(map) = obj {
+                let val = map.remove(&id_key).unwrap();
+                map.insert("id".to_string(), val);
+            }
+        }
+    }
+     
+
+    // Write chunks
     for chunk in json_rows.chunks(max_docs) {
         let file_id = counter.fetch_add(1, Ordering::SeqCst);
         let output_filename = get_output_filename(output_dir, prefix, file_id);
