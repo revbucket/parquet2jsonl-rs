@@ -1,17 +1,11 @@
 
-use serde_json::{Value, Map};
-use indicatif::{ProgressBar, ProgressStyle};
 use clap::{Parser};
 use anyhow::{Result, Error};
 use std::time::Instant;
 use std::path::PathBuf;
 use rayon::prelude::*;
-use crate::local_io::{expand_dirs, write_mem_to_pathbuf, parquet_to_json};
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-
-pub mod local_io;
-
+use mj_io::{build_pbar, expand_dirs, write_mem_to_pathbuf, get_output_filename};
+use polars::prelude::*;
 
 
 /*
@@ -19,7 +13,7 @@ pub mod local_io;
 Quick'n'dirty rust tool to convert .parquets to jsonl.gz files
 Steps:
 1. List all .parquet files
-2. (in parallel) break into jsonl.gz's  
+2. (in parallel) break into jsonl.zstds's  
 3. Writes to output directory 
 
 
@@ -29,88 +23,42 @@ Notes: will only keep the provided 'text' and 'id' fields
 
 #[derive(Parser, Debug)]
 struct Args {
-    /// (List of) directories/files (on s3 or local) that are jsonl.gz or jsonl.zstd files
-    #[arg(required=true, long, num_args=1..)]
-    input: Vec<PathBuf>,
 
-
-    /// Output location (may be an s3 uri)
+    /// Input dir location 
     #[arg(required=true, long)]
-    output: PathBuf,
+    input_dir: PathBuf,    
 
-    /// Shard prefix: Files will be named {shard_prefix}_{shard_num}.jsonl.gz
+    /// Output location 
     #[arg(required=true, long)]
-    prefix: String,
-
-    /// Name of the field of the text
-    #[arg(long, default_value_t=String::from("text"))]
-    text_key: String,
-
-    /// Name of the field of the id 
-    #[arg(required=true, long)]
-    id_key: String,
-
-    /// Maximum docs per jsonl
-    #[arg(long, required=true)]
-    max_docs: usize,
-
-
+    output_dir: PathBuf,
 
 }
-
-fn build_pbar(num_items: usize, units: &str) -> ProgressBar {
-    let mut template = String::from(units);
-    template.push_str(" {human_pos}/{human_len} [{elapsed_precise}/{duration_precise}] [{wide_bar:.cyan/blue}]");
-    let pbar = ProgressBar::new(num_items as u64)
-        .with_style(
-            ProgressStyle::with_template(&template).unwrap()
-        );
-    pbar.inc(0);
-    pbar
-}
-
-
-
 
 /*====================================================
 =                  PROCESS PARQUET                   =
 ====================================================*/
 
 
-fn process_parquet(parquet: &PathBuf, counter: &AtomicUsize, text_key: String, id_key: String, max_docs: usize, output_dir: &PathBuf, prefix: &str) -> Result<(), Error> {
+fn convert_pqt_to_jsonl(input_path: &PathBuf, output_path: &PathBuf) -> Result<(), Error> {
+    let df = LazyFrame::scan_parquet(input_path, ScanArgsParquet::default()).unwrap()
+        .collect()?;
+    // Convert to JSON strings
+    let mut output_vec: Vec<u8> = Vec::new();
+    df.iter().for_each(|row| {
+        let json_row = serde_json::to_vec(&row.iter()
+                .zip(df.get_column_names())
+                .map(|(value, name)| (name, value))
+                .collect::<std::collections::HashMap<_, _>>())
+                .unwrap();   
+        output_vec.extend(json_row);
+        output_vec.push(b'\n');
 
-    let cols: Vec<String> = vec![text_key, id_key.clone()];
-    let mut json_rows = parquet_to_json(parquet, Some(cols)).unwrap();
+    });
 
-    if id_key.clone() != "id" {
-        for obj in json_rows.iter_mut() {
-            if let Value::Object(map) = obj {
-                let val = map.remove(&id_key).unwrap();
-                map.insert("id".to_string(), val);
-            }
-        }
-    }
-     
-
-    // Write chunks
-    for chunk in json_rows.chunks(max_docs) {
-        let file_id = counter.fetch_add(1, Ordering::SeqCst);
-        let output_filename = get_output_filename(output_dir, prefix, file_id);
-        let line_chunk: Vec<String> = chunk.into_iter().map(|el| serde_json::to_string(el).unwrap()).collect();
-        let contents = line_chunk.join("\n").into_bytes();
-        write_mem_to_pathbuf(&contents, &output_filename).unwrap()
-    }
-
+    write_mem_to_pathbuf(&output_vec, output_path).unwrap();
 
     Ok(())
 }
-
-
-fn get_output_filename(output_dir: &PathBuf, prefix: &str, id: usize) -> PathBuf {
-    PathBuf::from(output_dir).join(format!("{}{:08}.jsonl.gz", prefix, id))
-}
-
-
 
 /*====================================================
 =                   MAIN FUNCTION                    =
@@ -121,23 +69,23 @@ fn main() {
     let start_time = Instant::now();
     let args = Args::parse();
 
-    let input_files: Vec<PathBuf> = expand_dirs(args.input).unwrap();
+    let input_files: Vec<PathBuf> = expand_dirs(vec![args.input_dir.clone()], None).unwrap();
     let num_inputs = input_files.len();
+
 
     let pbar = build_pbar(num_inputs, "Parquets");
 
-    let counter = AtomicUsize::new(0);
-
     input_files.par_iter().for_each(|p| {
-        process_parquet(p, &counter, args.text_key.clone(), args.id_key.clone(), args.max_docs, &args.output, &args.prefix).unwrap();
+        let output_p = get_output_filename(p, &args.input_dir, &args.output_dir).unwrap().with_extension("jsonl.zst");
+        convert_pqt_to_jsonl(p, &output_p).unwrap();
+        
         pbar.inc(1);
-
     });
+
 
     println!("-------------------------");
     println!("Completed parquet to json in {:?} (s)", start_time.elapsed().as_secs());
-    println!("Processed {:?} parquet files", num_inputs);
-    println!("Created {:?} jsons", counter.fetch_add(0, Ordering::SeqCst));
+
 
 }
 
