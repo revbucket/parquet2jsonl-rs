@@ -40,26 +40,19 @@ struct Args {
 
 
 fn convert_pqt_to_jsonl(input_path: &PathBuf, output_path: &PathBuf) -> Result<(), Error> {
-    let df = LazyFrame::scan_parquet(input_path, ScanArgsParquet::default()).unwrap()
+    let mut df = LazyFrame::scan_parquet(input_path, ScanArgsParquet::default())?
         .collect()?;
-    // Convert to JSON strings
+    
     let mut output_vec: Vec<u8> = Vec::new();
-    df.iter().for_each(|row| {
-        let json_row = serde_json::to_vec(&row.iter()
-                .zip(df.get_column_names())
-                .map(|(value, name)| (name, value))
-                .collect::<std::collections::HashMap<_, _>>())
-                .unwrap();   
-        output_vec.extend(json_row);
-        output_vec.push(b'\n');
+    
+    // Use Polars' built-in JSON writer to write to memory
+    JsonWriter::new(&mut output_vec)
+        .with_json_format(JsonFormat::JsonLines)
+        .finish(&mut df)?;
 
-    });
-
-    write_mem_to_pathbuf(&output_vec, output_path).unwrap();
-
+    write_mem_to_pathbuf(&output_vec, output_path)?;
     Ok(())
 }
-
 /*====================================================
 =                   MAIN FUNCTION                    =
 ====================================================*/
@@ -69,7 +62,7 @@ fn main() {
     let start_time = Instant::now();
     let args = Args::parse();
 
-    let input_files: Vec<PathBuf> = expand_dirs(vec![args.input_dir.clone()], None).unwrap();
+    let input_files: Vec<PathBuf> = expand_dirs(vec![args.input_dir.clone()], Some(&vec!["parquet"])).unwrap();
     let num_inputs = input_files.len();
 
 
